@@ -167,3 +167,5 @@ jobs:
           else
             echo "::notice title=Release cut::${TAG} created at ${SHA}. No image build dispatched — the tag does not match a release pattern."
           fi
+
+<!-- cut-release probe: touches no ci.yml-filtered path, so CI should not run -->
