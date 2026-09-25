@@ -168,4 +168,5 @@ jobs:
             echo "::notice title=Release cut::${TAG} created at ${SHA}. No image build dispatched — the tag does not match a release pattern."
           fi
 
-<!-- cut-release probe: touches no ci.yml-filtered path, so CI should not run -->
+# Probe: this file is outside ci.yml's paths filter, so editing it alone
+# produces a commit with no CI run — the state the gate must tolerate here.
