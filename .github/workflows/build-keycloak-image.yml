@@ -176,7 +176,13 @@ jobs:
           exit-code: "0"   # Phase A: report-only, never fails the build
 
       - name: Upload Trivy image SARIF
-        if: ${{ always() && (github.event_name != 'workflow_dispatch' || inputs.push) }}
+        # `always()` alone is too broad: it also covers "the scan never ran",
+        # so any earlier failure (a registry login, say) produced a SECOND red
+        # step complaining `Path does not exist: trivy-image.sarif` and buried
+        # the real cause. Gating on the build digest keeps the intended
+        # behaviour — upload even when Trivy exits non-zero on findings — while
+        # skipping cleanly when no scan happened. Matches signals-dpg.
+        if: ${{ always() && steps.build.outputs.digest != '' }}
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
         with:
           sarif_file: trivy-image.sarif
