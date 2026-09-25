@@ -36,8 +36,17 @@ on:
   # predating this change will not pick the patterns up.
   #
   # Still NOT run on branch pushes or PRs — this stays out of app CI/CD.
+  # Rebuild when this image's own inputs change, and on demand. Deliberately
+  # NOT on release tags: this is an infrastructure base image on its own
+  # cadence, and a release of the service repos says nothing about whether the
+  # Keycloak image needs rebuilding. cut-release.yml therefore does not dispatch
+  # it either — rebuild it here when dockerfiles/keycloak/ changes, then re-pin
+  # the new sha- tag in opentofu/aws/<env>/global-images.yaml.
   push:
-    tags: ['v*.*.*', '20*-s*-rc*']
+    branches: [develop, main]
+    paths:
+      - 'dockerfiles/keycloak/**'
+      - '.github/workflows/build-keycloak-image.yml'
   workflow_dispatch:
     inputs:
       platforms:
@@ -114,10 +123,8 @@ jobs:
         with:
           images: ${{ steps.ref.outputs.image }}
           tags: |
-            type=ref,event=branch
             type=ref,event=tag
             type=sha,prefix=sha-
-            type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=keycloak-server
             org.opencontainers.image.description=Keycloak with the OTP authenticator SPI baked in and pre-indexed

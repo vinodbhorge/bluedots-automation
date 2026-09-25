@@ -14,11 +14,13 @@ name: Cut release
 #
 #   2. Tag names here are not uniform. Alongside v1.0.0 and 202609-s1-rc1 the
 #      repo carries `samadhan`, `samadhan-smtp` and 202609-s1-rc1-up-dhwd —
-#      deployment markers rather than release tags. Rejecting those would break
-#      existing practice, so a non-release name is a WARNING: the tag and the
-#      release are still created, the image builds simply are not dispatched,
-#      because build-keycloak-image.yml and build-postgres-image.yml only fire
-#      on v*.*.* and 20*-s*-rc*.
+#      deployment markers rather than release tags. Any name is accepted.
+#
+# It creates a tag and its notes, and nothing else. The two image builds are NOT
+# dispatched from here: they are infrastructure base images on their own cadence,
+# rebuilt by build-keycloak-image.yml / build-postgres-image.yml when their own
+# dockerfiles/ inputs change or on demand. A release of this repo does not imply
+# they need rebuilding, and a tag no longer triggers them.
 #
 # It does NOT prevent someone running `git tag && git push` from a laptop. Only
 # a tag ruleset can do that. This is the paved road, not the fence.
@@ -26,7 +28,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag name. v*.*.* or 20*-s*-rc* also builds the images; any other name just tags.'
+        description: 'Tag name, e.g. 202610-s1-rc1, v1.2.0, or a deployment marker'
         required: true
         type: string
       base:
@@ -46,7 +48,7 @@ on:
 
 permissions:
   contents: write   # create the tag ref and the release
-  actions: write    # read CI runs, and dispatch the image builds
+  actions: read     # read ci.yml runs for the commit being tagged
 
 jobs:
   cut:
@@ -64,28 +66,17 @@ jobs:
         run: |
           set -euo pipefail
 
-          # ── 1. Classify the tag name ──────────────────────────────────────
-          # Not a gate. Only decides whether the image builds get dispatched at
-          # the end, because those two workflows are the things that care.
-          if printf '%s' "${TAG}" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|20[0-9]{4}-s[0-9]+-rc[0-9]+)'; then
-            BUILDS_IMAGES=true
-            echo "'${TAG}' matches a release pattern — the keycloak and postgres images will be built."
-          else
-            BUILDS_IMAGES=false
-            echo "::warning title=Not a release tag::'${TAG}' matches neither v*.*.* nor 20*-s*-rc*, so build-keycloak-image.yml and build-postgres-image.yml will NOT run. The tag and its release are still created — this is the right shape for a deployment marker such as 'samadhan'."
-          fi
-
-          # ── 2. Refuse to move an existing tag ─────────────────────────────
+          # ── 1. Refuse to move an existing tag ─────────────────────────────
           if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
             echo "::error title=Tag already exists::${TAG} is already present. Tags are immutable — pick another name."
             exit 1
           fi
 
-          # ── 3. Resolve the commit being tagged ────────────────────────────
+          # ── 2. Resolve the commit being tagged ────────────────────────────
           SHA=$(gh api "repos/${REPO}/commits/${BASE}" --jq '.sha')
           echo "Tagging ${BASE} @ ${SHA}"
 
-          # ── 4. The gate — fail OPEN on absence, CLOSED on failure ─────────
+          # ── 3. The gate — fail OPEN on absence, CLOSED on failure ─────────
           if [ "${SKIP:-false}" = "true" ]; then
             echo "::warning title=CI gate bypassed::Cutting ${TAG} at ${SHA} without checking CI, because skip_ci_check was set."
           else
@@ -111,15 +102,13 @@ jobs:
             fi
           fi
 
-          # ── 5. Preview the notes ──────────────────────────────────────────
+          # ── 4. Preview the notes ──────────────────────────────────────────
           notes=$(gh api "repos/${REPO}/releases/generate-notes" \
             -f tag_name="${TAG}" -f target_commitish="${SHA}" --jq '.body')
           {
             echo "## ${TAG}"
             echo
             echo "Commit \`${SHA}\` from \`${BASE}\`"
-            echo
-            echo "Builds images: ${BUILDS_IMAGES}"
             echo
             echo "${notes}"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -129,7 +118,7 @@ jobs:
             exit 0
           fi
 
-          # ── 6. Create the tag AND the release, in one call ────────────────
+          # ── 5. Create the tag AND the release, in one call ────────────────
           # POST /releases creates the tag itself when tag_name does not yet
           # exist, using target_commitish. One call rather than two removes the
           # partial state a two-step version leaves behind — a tag with no notes
@@ -154,19 +143,4 @@ jobs:
             -f body="${notes}" \
             --jq '"Created release \(.name) at \(.target_commitish[0:8]) -> \(.html_url)"'
 
-          # ── 7. Build and publish the two infrastructure images ────────────
-          # --repo is required: gh infers the repository from git context
-          # otherwise, and there is no checkout here. Both workflows default
-          # `push` to true; it is passed explicitly so the intent is in the log.
-          if [ "${BUILDS_IMAGES}" = "true" ]; then
-            for wf in build-keycloak-image.yml build-postgres-image.yml; do
-              gh workflow run "${wf}" --repo "${REPO}" --ref "${TAG}" -f push=true
-              echo "Dispatched ${wf} against ${TAG}"
-            done
-            echo "::notice title=Release cut::${TAG} created at ${SHA}; keycloak-server and postgres-pgvector builds dispatched."
-          else
-            echo "::notice title=Release cut::${TAG} created at ${SHA}. No image build dispatched — the tag does not match a release pattern."
-          fi
-
-# Probe: this file is outside ci.yml's paths filter, so editing it alone
-# produces a commit with no CI run — the state the gate must tolerate here.
+          echo "::notice title=Release cut::${TAG} created at ${SHA}. No image build was dispatched — the keycloak and postgres images rebuild from their own dockerfiles/ changes, not from a release tag."

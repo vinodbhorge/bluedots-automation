@@ -20,8 +20,17 @@ on:
   # predating this change will not pick the patterns up.
   #
   # Still NOT run on branch pushes or PRs — this stays out of app CI/CD.
+  # Rebuild when this image's own inputs change, and on demand. Deliberately
+  # NOT on release tags: this is an infrastructure base image on its own
+  # cadence, and a release of the service repos says nothing about whether the
+  # Postgres image needs rebuilding. cut-release.yml therefore does not dispatch
+  # it either — rebuild it here when dockerfiles/postgres/ changes, then re-pin
+  # the new sha- tag in opentofu/aws/<env>/global-images.yaml.
   push:
-    tags: ['v*.*.*', '20*-s*-rc*']
+    branches: [develop, main]
+    paths:
+      - 'dockerfiles/postgres/**'
+      - '.github/workflows/build-postgres-image.yml'
   workflow_dispatch:
     inputs:
       platforms:
