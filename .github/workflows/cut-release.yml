@@ -1,0 +1,169 @@
+name: Cut release
+# Creates a release tag, writes its notes, and kicks off the two image builds.
+# Companion to the same workflow in the four service repos
+# (Blue-Dots-Economy/signals-dpg#765), but deliberately NOT a copy of it — this
+# is an infrastructure repo and two of its properties change the design:
+#
+#   1. ci.yml is PATHS-FILTERED (helm/**, opentofu/**, scripts/**, and the two
+#      dhi image lists). Plenty of legitimate commits on develop therefore have
+#      no CI run at all — a change under dockerfiles/ or docs/ never triggers
+#      it. The service repos fail CLOSED when no run exists, because there a
+#      missing run means "CI never saw this commit". Here it usually means "CI
+#      correctly had nothing to check", so this workflow fails OPEN on absence
+#      and only blocks when a run exists and none of them succeeded.
+#
+#   2. Tag names here are not uniform. Alongside v1.0.0 and 202609-s1-rc1 the
+#      repo carries `samadhan`, `samadhan-smtp` and 202609-s1-rc1-up-dhwd —
+#      deployment markers rather than release tags. Rejecting those would break
+#      existing practice, so a non-release name is a WARNING: the tag and the
+#      release are still created, the image builds simply are not dispatched,
+#      because build-keycloak-image.yml and build-postgres-image.yml only fire
+#      on v*.*.* and 20*-s*-rc*.
+#
+# It does NOT prevent someone running `git tag && git push` from a laptop. Only
+# a tag ruleset can do that. This is the paved road, not the fence.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name. v*.*.* or 20*-s*-rc* also builds the images; any other name just tags.'
+        required: true
+        type: string
+      base:
+        description: 'Branch to cut the tag from'
+        required: true
+        default: develop
+        type: choice
+        options: [develop, main]
+      dry_run:
+        description: 'Check everything and preview the notes, but create nothing'
+        type: boolean
+        default: false
+      skip_ci_check:
+        description: 'Tag even if CI failed on this commit (emergency use only)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # create the tag ref and the release
+  actions: write    # read CI runs, and dispatch the image builds
+
+jobs:
+  cut:
+    name: Cut ${{ inputs.tag }} from ${{ inputs.base }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cut the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          BASE: ${{ inputs.base }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          SKIP: ${{ inputs.skip_ci_check }}
+        run: |
+          set -euo pipefail
+
+          # ── 1. Classify the tag name ──────────────────────────────────────
+          # Not a gate. Only decides whether the image builds get dispatched at
+          # the end, because those two workflows are the things that care.
+          if printf '%s' "${TAG}" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|20[0-9]{4}-s[0-9]+-rc[0-9]+)'; then
+            BUILDS_IMAGES=true
+            echo "'${TAG}' matches a release pattern — the keycloak and postgres images will be built."
+          else
+            BUILDS_IMAGES=false
+            echo "::warning title=Not a release tag::'${TAG}' matches neither v*.*.* nor 20*-s*-rc*, so build-keycloak-image.yml and build-postgres-image.yml will NOT run. The tag and its release are still created — this is the right shape for a deployment marker such as 'samadhan'."
+          fi
+
+          # ── 2. Refuse to move an existing tag ─────────────────────────────
+          if gh api "repos/${REPO}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error title=Tag already exists::${TAG} is already present. Tags are immutable — pick another name."
+            exit 1
+          fi
+
+          # ── 3. Resolve the commit being tagged ────────────────────────────
+          SHA=$(gh api "repos/${REPO}/commits/${BASE}" --jq '.sha')
+          echo "Tagging ${BASE} @ ${SHA}"
+
+          # ── 4. The gate — fail OPEN on absence, CLOSED on failure ─────────
+          if [ "${SKIP:-false}" = "true" ]; then
+            echo "::warning title=CI gate bypassed::Cutting ${TAG} at ${SHA} without checking CI, because skip_ci_check was set."
+          else
+            runs=$(gh api --paginate \
+              "repos/${REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}" \
+              --jq '.workflow_runs[] | "\(.status)/\(.conclusion // "pending")\t\(.event)\t\(.html_url)"')
+
+            if [ -z "${runs}" ]; then
+              # NOT an error here. ci.yml is paths-filtered, so this is the
+              # normal state for a commit that touched none of helm/**,
+              # opentofu/** or scripts/**.
+              echo "::warning title=No CI run for this commit::ci.yml has not run for ${SHA}. That is expected when the change touched none of the paths ci.yml filters on; proceeding. Verify by hand if this release does change Helm or OpenTofu."
+            else
+              echo "ci.yml runs for ${SHA}:"
+              echo "${runs}" | sed 's/^/  /'
+
+              if echo "${runs}" | grep -q '^completed/success'; then
+                echo "CI passed for ${SHA}."
+              else
+                echo "::error title=CI did not pass::ci.yml ran for ${SHA} and no run succeeded. Fix CI on ${BASE} before cutting ${TAG}, or re-run with skip_ci_check if this is a deliberate emergency."
+                exit 1
+              fi
+            fi
+          fi
+
+          # ── 5. Preview the notes ──────────────────────────────────────────
+          notes=$(gh api "repos/${REPO}/releases/generate-notes" \
+            -f tag_name="${TAG}" -f target_commitish="${SHA}" --jq '.body')
+          {
+            echo "## ${TAG}"
+            echo
+            echo "Commit \`${SHA}\` from \`${BASE}\`"
+            echo
+            echo "Builds images: ${BUILDS_IMAGES}"
+            echo
+            echo "${notes}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${DRY_RUN:-false}" = "true" ]; then
+            echo "::notice title=Dry run::All checks passed. ${TAG} was NOT created. The notes preview is in the run summary."
+            exit 0
+          fi
+
+          # ── 6. Create the tag AND the release, in one call ────────────────
+          # POST /releases creates the tag itself when tag_name does not yet
+          # exist, using target_commitish. One call rather than two removes the
+          # partial state a two-step version leaves behind — a tag with no notes
+          # and no build, which then blocks its own retry at step 2.
+          #
+          # Deliberately the REST API, not `gh release create` / `git push`:
+          #   * `gh release create` shells out to git and fails with "not a git
+          #     repository" — this job has no checkout and does not need one.
+          #   * a tag pushed with GITHUB_TOKEN does NOT trigger `on: push: tags`
+          #     (GitHub suppresses it to prevent recursion), so the image builds
+          #     would sit silent. Step 7 dispatches them explicitly instead —
+          #     workflow_dispatch is an exception to that suppression rule.
+          #
+          # The body is the SAME string previewed in step 5, so what the dry run
+          # shows is byte-identical to what gets published. Note the create
+          # endpoint's flag is `generate_release_notes`; `generate_notes` (the
+          # name of the separate preview endpoint) is silently ignored.
+          gh api "repos/${REPO}/releases" \
+            -f tag_name="${TAG}" \
+            -f name="${TAG}" \
+            -f target_commitish="${SHA}" \
+            -f body="${notes}" \
+            --jq '"Created release \(.name) at \(.target_commitish[0:8]) -> \(.html_url)"'
+
+          # ── 7. Build and publish the two infrastructure images ────────────
+          # --repo is required: gh infers the repository from git context
+          # otherwise, and there is no checkout here. Both workflows default
+          # `push` to true; it is passed explicitly so the intent is in the log.
+          if [ "${BUILDS_IMAGES}" = "true" ]; then
+            for wf in build-keycloak-image.yml build-postgres-image.yml; do
+              gh workflow run "${wf}" --repo "${REPO}" --ref "${TAG}" -f push=true
+              echo "Dispatched ${wf} against ${TAG}"
+            done
+            echo "::notice title=Release cut::${TAG} created at ${SHA}; keycloak-server and postgres-pgvector builds dispatched."
+          else
+            echo "::notice title=Release cut::${TAG} created at ${SHA}. No image build dispatched — the tag does not match a release pattern."
+          fi
