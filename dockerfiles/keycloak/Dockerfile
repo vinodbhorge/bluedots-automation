@@ -119,3 +119,5 @@ USER nonroot
 ENTRYPOINT ["/opt/keycloak/bin/kc.sh"]
 # Overridden by the chart's `args:`; kept so `docker run` on this image behaves.
 CMD ["start", "--optimized", "--import-realm"]
+
+# trigger probe: only this image should rebuild
