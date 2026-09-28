@@ -64,4 +64,5 @@ jobs:
     with:
       language: iac
       run-gitleaks: true
+      block-secrets: true   # FORK TEST: prove a finding now fails the job
       block: false
